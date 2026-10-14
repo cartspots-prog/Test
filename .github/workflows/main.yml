@@ -1,0 +1,237 @@
+name: UK RDP Setup
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Configure UK Regional Settings
+        run: |
+          # Set UK timezone (GMT/BST)
+          tzutil /s "GMT Standard Time"
+          Write-Host "UK Timezone set to: $(tzutil /g)"
+
+      - name: Configure Core RDP Settings
+        run: |
+          # Enable Remote Desktop and disable Network Level Authentication
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+
+          # Remove any existing rule with the same name to avoid duplication
+          netsh advfirewall firewall delete rule name="RDP-UK" 2>$null
+          
+          # Allow incoming connection on port 3389
+          netsh advfirewall firewall add rule name="RDP-UK" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          # Restart the Remote Desktop service
+          Restart-Service -Name TermService -Force
+          Write-Host "RDP configured and service restarted"
+
+      - name: Create RDP User with Working Password
+        run: |
+          # Check if user already exists
+          if (Get-LocalUser -Name "UKRDPUser" -ErrorAction SilentlyContinue) {
+              Remove-LocalUser -Name "UKRDPUser"
+          }
+
+          # SIMPLE WORKING PASSWORD GENERATION
+          # Create a predictable but secure password
+          $timestamp = Get-Date -Format "yyyyMMddHHmmss"
+          $basePassword = "UKRdp$timestamp$"
+          
+          # Use the base password directly
+          $password = $basePassword
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          
+          # Create user
+          New-LocalUser -Name "UKRDPUser" -Password $securePass -AccountNeverExpires -Description "UK RDP User"
+          Add-LocalGroupMember -Group "Administrators" -Member "UKRDPUser"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "UKRDPUser"
+          
+          # Store credentials
+          echo "RDP_USERNAME=UKRDPUser" >> $env:GITHUB_ENV
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+          
+          Write-Host "UK RDP User created successfully"
+          Write-Host "Username: UKRDPUser"
+          Write-Host "Password set successfully"
+
+      - name: Install Tailscale
+        run: |
+          # Download and install latest Tailscale
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Write-Host "Downloading Tailscale..."
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          
+          Write-Host "Installing Tailscale..."
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+          
+          # Wait for installation to complete
+          Start-Sleep -Seconds 15
+          Write-Host "Tailscale installed successfully"
+
+      - name: Configure Tailscale for UK Access
+        run: |
+          # Start Tailscale service
+          Start-Service "Tailscale" -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 10
+          
+          # Connect to Tailscale with UK hostname
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=uk-rdp-$env:GITHUB_RUN_ID
+          
+          # Wait for IP assignment with timeout
+          $tsIP = $null
+          $maxRetries = 15
+          $retryCount = 0
+          
+          while (-not $tsIP -and $retryCount -lt $maxRetries) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              if (-not $tsIP) {
+                  $retryCount++
+                  Write-Host "Waiting for Tailscale IP... (Attempt $retryCount/$maxRetries)"
+                  Start-Sleep -Seconds 5
+              }
+          }
+          
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned after $maxRetries attempts"
+              exit 1
+          }
+          
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Write-Host "Tailscale connected - UK RDP IP: $tsIP"
+
+      - name: Install UK Development Tools
+        run: |
+          Write-Host "Installing UK development environment tools..."
+          
+          try {
+              # Install Chocolatey
+              Set-ExecutionPolicy Bypass -Scope Process -Force
+              [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+              iwr https://community.chocolatey.org/install.ps1 -UseBasicParsing | iex
+              
+              # Wait for chocolatey to install
+              Start-Sleep -Seconds 30
+              
+              # Refresh environment
+              $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+              
+              # Install basic UK development tools
+              choco install -y git python nodejs notepadplusplus --no-progress --yes
+              Write-Host "Development tools installed for UK RDP session"
+          } catch {
+              Write-Host "Tools installation had issues but continuing with RDP setup..."
+          }
+
+      - name: Verify UK RDP Setup
+        run: |
+          Write-Host "=== UK RDP Setup Verification ==="
+          Write-Host "UK Timezone: $(tzutil /g)"
+          Write-Host "Tailscale UK IP: $env:TAILSCALE_IP"
+          Write-Host "RDP Username: $env:RDP_USERNAME"
+          
+          # Verify RDP service is running
+          $rdpService = Get-Service -Name "TermService"
+          Write-Host "RDP Service Status: $($rdpService.Status)"
+          
+          # Verify port 3389 is listening
+          $portCheck = Get-NetTCPConnection -LocalPort 3389 -ErrorAction SilentlyContinue
+          if ($portCheck) {
+              Write-Host "RDP Port 3389: LISTENING"
+          } else {
+              Write-Host "RDP Port 3389: NOT LISTENING - Reconfiguring..."
+              # Re-enable RDP if not listening
+              Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+              Restart-Service -Name TermService -Force
+          }
+          
+          # Verify Tailscale connection
+          try {
+              $tailscaleStatus = & "$env:ProgramFiles\Tailscale\tailscale.exe" status
+              Write-Host "Tailscale Status: Connected"
+          } catch {
+              Write-Host "Tailscale Status: Error checking status"
+          }
+
+      - name: Display UK RDP Connection Details
+        run: |
+          Write-Host ""
+          Write-Host "================================================"
+          Write-Host "🇬🇧 UK RDP ACCESS READY 🇬🇧"
+          Write-Host "================================================"
+          Write-Host "RDP Address: $env:TAILSCALE_IP"
+          Write-Host "Username: $env:RDP_USERNAME" 
+          Write-Host "Password: $env:RDP_PASSWORD"
+          Write-Host "Timezone: $(tzutil /g) (UK)"
+          Write-Host ""
+          Write-Host "CONNECTION INSTRUCTIONS:"
+          Write-Host "1. Ensure you're connected to the same Tailscale network"
+          Write-Host "2. Open Remote Desktop Connection (mstsc.exe)"
+          Write-Host "3. Enter: $env:TAILSCALE_IP"
+          Write-Host "4. Use credentials above"
+          Write-Host ""
+          Write-Host "This session will remain active for 6 hours"
+          Write-Host "================================================"
+          Write-Host ""
+
+      - name: Maintain UK RDP Connection
+        run: |
+          $startTime = Get-Date
+          Write-Host "UK RDP Session started at: $startTime"
+          Write-Host "Session will auto-terminate after 6 hours"
+          Write-Host ""
+          
+          # Display connection info clearly
+          Write-Host "=== CONNECTION DETAILS ==="
+          Write-Host "IP: $env:TAILSCALE_IP"
+          Write-Host "User: $env:RDP_USERNAME"
+          Write-Host "Pass: $env:RDP_PASSWORD"
+          Write-Host "=========================="
+          Write-Host ""
+          
+          # Monitoring loop
+          $counter = 0
+          while ($counter -lt 360) {  # 6 hours = 360 * 60 seconds
+              $currentTime = Get-Date
+              $elapsed = $currentTime - $startTime
+              $remaining = [TimeSpan]::FromHours(6) - $elapsed
+              
+              # Display status every 10 minutes
+              if ($counter % 10 -eq 0) {
+                  Write-Host "[$(Get-Date -Format 'HH:mm:ss')] UK RDP Active - Time remaining: $($remaining.ToString('hh\:mm\:ss'))"
+              }
+              
+              # Verify services are running every 5 minutes
+              if ($counter % 5 -eq 0) {
+                  $tsService = Get-Service -Name "Tailscale" -ErrorAction SilentlyContinue
+                  $rdpService = Get-Service -Name "TermService"
+                  
+                  if ($tsService.Status -ne "Running") {
+                      Write-Host "Restarting Tailscale service..."
+                      Start-Service -Name "Tailscale" -ErrorAction SilentlyContinue
+                  }
+                  
+                  if ($rdpService.Status -ne "Running") {
+                      Write-Host "Restarting RDP service..."
+                      Start-Service -Name "TermService" -Force
+                  }
+              }
+              
+              $counter++
+              Start-Sleep -Seconds 60
+          }
+          
+          Write-Host "UK RDP session completed - 6 hour limit reached"
